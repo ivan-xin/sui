@@ -2391,34 +2391,27 @@ impl AuthorityPerEpochStore {
     }
 
     pub(crate) fn get_new_jwks(&self, round: u64) -> SuiResult<Vec<ActiveJwk>> {
-        let epoch = self.epoch();
-
-        let empty_jwk_id = JwkId::new(String::new(), String::new());
-        let empty_jwk = JWK {
-            kty: String::new(),
-            e: String::new(),
-            n: String::new(),
-            alg: String::new(),
-        };
-
-        let start = (round, (empty_jwk_id.clone(), empty_jwk.clone()));
-        let end = (round + 1, (empty_jwk_id, empty_jwk));
-
-        // TODO: use a safe iterator
-        Ok(self
-            .tables()?
-            .active_jwks
-            .safe_iter_with_bounds(Some(start), Some(end))
-            .map_ok(|((r, (jwk_id, jwk)), _)| {
-                debug_assert!(round == r);
-                ActiveJwk { jwk_id, jwk, epoch }
-            })
-            .collect::<Result<Vec<_>, _>>()?)
+        self.consensus_quarantine.read().get_new_jwks(self, round)
     }
 
     pub fn jwk_active_in_current_epoch(&self, jwk_id: &JwkId, jwk: &JWK) -> bool {
         let jwk_aggregator = self.jwk_aggregator.lock();
         jwk_aggregator.has_quorum_for_key(&(jwk_id.clone(), jwk.clone()))
+    }
+
+    pub(crate) fn get_randomness_last_round_timestamp(&self) -> SuiResult<Option<TimestampMs>> {
+        if let Some(ts) = self
+            .consensus_quarantine
+            .read()
+            .get_randomness_last_round_timestamp()
+        {
+            Ok(Some(ts))
+        } else {
+            Ok(self
+                .tables()?
+                .randomness_last_round_timestamp
+                .get(&SINGLETON_KEY)?)
+        }
     }
 
     pub fn test_insert_user_signature(
@@ -4373,6 +4366,62 @@ impl ConsensusOutputQuarantine {
             .iter()
             .any(|output| output.pending_checkpoint_exists(index))
     }
+
+    fn get_new_jwks(
+        &self,
+        epoch_store: &AuthorityPerEpochStore,
+        round: u64,
+    ) -> SuiResult<Vec<ActiveJwk>> {
+        let epoch = epoch_store.epoch();
+
+        // Check if the requested round is in memory
+        for output in self.output_queue.iter().rev() {
+            // unwrap safe because output will always have last consensus stats set before being added
+            // to the quarantine
+            let output_round = output.get_round().unwrap();
+            if round == output_round {
+                return Ok(output
+                    .active_jwks
+                    .iter()
+                    .map(|(_, (jwk_id, jwk))| ActiveJwk {
+                        jwk_id: jwk_id.clone(),
+                        jwk: jwk.clone(),
+                        epoch,
+                    })
+                    .collect());
+            }
+        }
+
+        // Fall back to reading from database
+        let empty_jwk_id = JwkId::new(String::new(), String::new());
+        let empty_jwk = JWK {
+            kty: String::new(),
+            e: String::new(),
+            n: String::new(),
+            alg: String::new(),
+        };
+
+        let start = (round, (empty_jwk_id.clone(), empty_jwk.clone()));
+        let end = (round + 1, (empty_jwk_id, empty_jwk));
+
+        Ok(epoch_store
+            .tables()?
+            .active_jwks
+            .safe_iter_with_bounds(Some(start), Some(end))
+            .map_ok(|((r, (jwk_id, jwk)), _)| {
+                debug_assert!(round == r);
+                ActiveJwk { jwk_id, jwk, epoch }
+            })
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn get_randomness_last_round_timestamp(&self) -> Option<TimestampMs> {
+        self.output_queue
+            .iter()
+            .rev()
+            .filter_map(|output| output.get_randomness_last_round_timestamp())
+            .next()
+    }
 }
 
 #[derive(Default)]
@@ -4409,6 +4458,10 @@ pub(crate) struct ConsensusCommitOutput {
 }
 
 impl ConsensusCommitOutput {
+    fn get_randomness_last_round_timestamp(&self) -> Option<TimestampMs> {
+        self.next_randomness_round.as_ref().map(|(_, ts)| *ts)
+    }
+
     fn get_highest_pending_checkpoint_height(&self) -> Option<CheckpointHeight> {
         // TODO: can we simply get the height of the last checkpoint in the list?
         self.pending_checkpoints.iter().map(|cp| cp.height()).max()
@@ -4441,6 +4494,12 @@ impl ConsensusCommitOutput {
 impl ConsensusCommitOutput {
     pub fn new() -> Self {
         Default::default()
+    }
+
+    fn get_round(&self) -> Option<u64> {
+        self.consensus_commit_stats
+            .as_ref()
+            .map(|stats| stats.index.last_committed_round)
     }
 
     fn insert_end_of_publish(&mut self, authority: AuthorityName) {
@@ -4551,22 +4610,25 @@ impl ConsensusCommitOutput {
             )?;
         }
 
-        if let Some(consensus_commit_stats) = &self.consensus_commit_stats {
-            batch.insert_batch(
-                &tables.last_consensus_index,
-                [(
-                    LAST_CONSENSUS_STATS_ADDR,
-                    ExecutionIndicesWithHash {
-                        index: consensus_commit_stats.index,
-                        hash: consensus_commit_stats.hash,
-                    },
-                )],
-            )?;
-            batch.insert_batch(
-                &tables.last_consensus_stats,
-                [(LAST_CONSENSUS_STATS_ADDR, consensus_commit_stats)],
-            )?;
-        }
+        let consensus_commit_stats = self
+            .consensus_commit_stats
+            .expect("consensus_commit_stats must be set");
+        let round = consensus_commit_stats.index.last_committed_round;
+
+        batch.insert_batch(
+            &tables.last_consensus_index,
+            [(
+                LAST_CONSENSUS_STATS_ADDR,
+                ExecutionIndicesWithHash {
+                    index: consensus_commit_stats.index,
+                    hash: consensus_commit_stats.hash,
+                },
+            )],
+        )?;
+        batch.insert_batch(
+            &tables.last_consensus_stats,
+            [(LAST_CONSENSUS_STATS_ADDR, consensus_commit_stats)],
+        )?;
 
         /*
         batch.insert_batch(
@@ -4646,7 +4708,11 @@ impl ConsensusCommitOutput {
         )?;
         batch.insert_batch(
             &tables.active_jwks,
-            self.active_jwks.into_iter().map(|j| (j, ())),
+            self.active_jwks.into_iter().map(|j| {
+                // TODO: we don't need to store the round in this map if it is invariant
+                assert_eq!(j.0, round);
+                (j, ())
+            }),
         )?;
 
         Ok(())
