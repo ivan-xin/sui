@@ -72,7 +72,7 @@ use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::object::Object;
 use sui_types::storage::{MarkerValue, ObjectKey, ObjectOrTombstone, ObjectStore, PackageObject};
 use sui_types::sui_system_state::{get_sui_system_state, SuiSystemState};
-use sui_types::transaction::{VerifiedSignedTransaction, VerifiedTransaction};
+use sui_types::transaction::{TransactionDataAPI, VerifiedSignedTransaction, VerifiedTransaction};
 use tap::TapOptional;
 use tracing::{debug, info, instrument, trace, warn};
 
@@ -761,6 +761,15 @@ impl WritebackCache {
             events,
             ..
         } = &*tx_outputs;
+
+        if transaction
+            .data()
+            .intent_message()
+            .value
+            .is_randomness_update_tx()
+        {
+            self.store.commit_transaction(&transaction)?;
+        }
 
         // Deletions and wraps must be written first. The reason is that one of the deletes
         // may be a child object, and if we write the parent object first, a reader may or may

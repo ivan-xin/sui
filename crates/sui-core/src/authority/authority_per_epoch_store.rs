@@ -75,8 +75,8 @@ use crate::epoch::reconfiguration::ReconfigState;
 use crate::execution_cache::ObjectCacheRead;
 use crate::module_cache_metrics::ResolverMetrics;
 use crate::post_consensus_tx_reorder::PostConsensusTxReorder;
-use crate::signature_verifier::*;
 use crate::stake_aggregator::{GenericMultiStakeAggregator, StakeAggregator};
+use crate::{epoch, signature_verifier::*};
 use move_bytecode_utils::module_cache::SyncModuleCache;
 use mysten_common::sync::notify_once::NotifyOnce;
 use mysten_common::sync::notify_read::NotifyRead;
@@ -3906,7 +3906,6 @@ impl AuthorityPerEpochStore {
                 position_in_commit,
             };
 
-            debug!("inserting builder summary {:?}", summary);
             self.consensus_quarantine.write().insert_builder_summary(
                 sequence_number,
                 summary,
@@ -3965,16 +3964,20 @@ impl AuthorityPerEpochStore {
         if let Some(BuilderCheckpointSummary { summary, .. }) =
             self.consensus_quarantine.read().last_built_summary()
         {
-            return Ok(Some((*summary.sequence_number(), summary.clone())));
+            let ret = Ok(Some((*summary.sequence_number(), summary.clone())));
+            debug!(?ret, "last_built_checkpoint_summary");
+            return ret;
         }
 
-        Ok(self
+        let ret = self
             .tables()?
             .builder_checkpoint_summary_v2
             .unbounded_iter()
             .skip_to_last()
             .next()
-            .map(|(seq, s)| (seq, s.summary)))
+            .map(|(seq, s)| (seq, s.summary));
+        debug!(?ret, "last_built_checkpoint_summary");
+        return Ok(ret);
     }
 
     pub fn get_built_checkpoint_summary(
@@ -4192,6 +4195,8 @@ pub(crate) struct ConsensusOutputQuarantine {
 
     // Highest known certificated checkpoint sequence number
     finalized_checkpoint_sequence_number: Option<CheckpointSequenceNumber>,
+    // Highest checkpoint sequence number for which all data has been committed.
+    committed_checkpoint_sequence_number: CheckpointSequenceNumber,
 
     // Any un-committed next versions are stored here. A ref-count is used to
     // evict keys when there is no longer
@@ -4233,8 +4238,29 @@ impl ConsensusOutputQuarantine {
             return Ok(());
         }
 
+        self.commit_finalized_data_range(
+            epoch_store,
+            self.committed_checkpoint_sequence_number,
+            sequence_number,
+        )
+    }
+
+    fn commit_finalized_data_range(
+        &mut self,
+        epoch_store: &AuthorityPerEpochStore,
+        from_seq: CheckpointSequenceNumber,
+        to_seq: CheckpointSequenceNumber,
+    ) -> SuiResult {
+        if from_seq == to_seq {
+            return Ok(());
+        }
+
+        info!(?from_seq, ?to_seq, "Committing finalized data");
+
         let mut batch = epoch_store.db_batch()?;
-        self.commit_finalized_data_impl(sequence_number, epoch_store, &mut batch)?;
+        for seq in (from_seq + 1)..=to_seq {
+            self.commit_finalized_data_impl(seq, epoch_store, &mut batch)?;
+        }
         batch.write()?;
         Ok(())
     }
@@ -4286,7 +4312,9 @@ impl ConsensusOutputQuarantine {
             .checkpoint_height
             .expect("non-genesis checkpoint must have height");
 
-        self.commit_consensus_up_to_height(epoch_store, height, batch)
+        self.commit_consensus_up_to_height(epoch_store, height, batch)?;
+        self.committed_checkpoint_sequence_number = seq;
+        Ok(())
     }
 
     fn commit_consensus_up_to_height(
@@ -4500,6 +4528,7 @@ impl ConsensusOutputQuarantine {
         summary: BuilderCheckpointSummary,
         contents: CheckpointContents,
     ) {
+        debug!(?sequence_number, "inserting builder summary {:?}", summary);
         for tx in contents.iter() {
             self.builder_digest_to_checkpoint
                 .insert(tx.transaction, sequence_number);
