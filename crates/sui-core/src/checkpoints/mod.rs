@@ -1239,7 +1239,7 @@ impl CheckpointBuilder {
 
         self.notify_aggregator.notify_one();
         self.epoch_store
-            .process_pending_checkpoint(height, new_checkpoints)?;
+            .process_pending_checkpoint(height, new_checkpoints);
         Ok(())
     }
 

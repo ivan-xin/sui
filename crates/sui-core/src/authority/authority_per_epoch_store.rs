@@ -1979,10 +1979,7 @@ impl AuthorityPerEpochStore {
     }
 
     pub fn deferred_transactions_empty(&self) -> bool {
-        self.tables()
-            .expect("deferred transactions should not be read past end of epoch")
-            .deferred_transactions
-            .is_empty()
+        self.deferred_transactions.lock().is_empty()
     }
 
     /// Check whether certificate was processed by consensus.
@@ -3897,12 +3894,10 @@ impl AuthorityPerEpochStore {
         &self,
         commit_height: CheckpointHeight,
         content_info: Vec<(CheckpointSummary, CheckpointContents)>,
-    ) -> SuiResult<()> {
-        let tables = self.tables()?;
+    ) {
         // All created checkpoints are inserted in builder_checkpoint_summary in a single batch.
         // This means that upon restart we can use BuilderCheckpointSummary::commit_height
         // from the last built summary to resume building checkpoints.
-        let mut batch = tables.builder_checkpoint_summary_v2.batch();
         for (position_in_commit, (summary, transactions)) in content_info.into_iter().enumerate() {
             let sequence_number = summary.sequence_number;
             let summary = BuilderCheckpointSummary {
@@ -3910,20 +3905,14 @@ impl AuthorityPerEpochStore {
                 checkpoint_height: Some(commit_height),
                 position_in_commit,
             };
-            debug!("inserting builder summary {:?}", summary);
-            batch.insert_batch(
-                &tables.builder_checkpoint_summary_v2,
-                [(&sequence_number, summary)],
-            )?;
-            batch.insert_batch(
-                &tables.builder_digest_to_checkpoint,
-                transactions
-                    .iter()
-                    .map(|tx| (tx.transaction, sequence_number)),
-            )?;
-        }
 
-        Ok(batch.write()?)
+            debug!("inserting builder summary {:?}", summary);
+            self.consensus_quarantine.write().insert_builder_summary(
+                sequence_number,
+                summary,
+                transactions,
+            );
+        }
     }
 
     /// Register genesis checkpoint in builder DB
@@ -3957,6 +3946,10 @@ impl AuthorityPerEpochStore {
     pub fn last_built_checkpoint_builder_summary(
         &self,
     ) -> SuiResult<Option<BuilderCheckpointSummary>> {
+        if let Some(summary) = self.consensus_quarantine.read().last_built_summary() {
+            return Ok(Some(summary.clone()));
+        }
+
         Ok(self
             .tables()?
             .builder_checkpoint_summary_v2
@@ -3969,6 +3962,12 @@ impl AuthorityPerEpochStore {
     pub fn last_built_checkpoint_summary(
         &self,
     ) -> SuiResult<Option<(CheckpointSequenceNumber, CheckpointSummary)>> {
+        if let Some(BuilderCheckpointSummary { summary, .. }) =
+            self.consensus_quarantine.read().last_built_summary()
+        {
+            return Ok(Some((*summary.sequence_number(), summary.clone())));
+        }
+
         Ok(self
             .tables()?
             .builder_checkpoint_summary_v2
@@ -3982,6 +3981,12 @@ impl AuthorityPerEpochStore {
         &self,
         sequence: CheckpointSequenceNumber,
     ) -> SuiResult<Option<CheckpointSummary>> {
+        if let Some(BuilderCheckpointSummary { summary, .. }) =
+            self.consensus_quarantine.read().get_built_summary(sequence)
+        {
+            return Ok(Some(summary.clone()));
+        }
+
         Ok(self
             .tables()?
             .builder_checkpoint_summary_v2
@@ -3993,10 +3998,40 @@ impl AuthorityPerEpochStore {
         &self,
         digests: impl Iterator<Item = &'a TransactionDigest>,
     ) -> SuiResult<Vec<bool>> {
-        Ok(self
+        let size_hint = digests.size_hint().0;
+        let mut results = Vec::with_capacity(size_hint);
+        let mut fallback_keys = Vec::with_capacity(size_hint);
+        let mut fallback_indices = Vec::with_capacity(size_hint);
+
+        {
+            let consensus_quarantine = self.consensus_quarantine.read();
+
+            for (i, digest) in digests.enumerate() {
+                if consensus_quarantine.included_transaction_in_checkpoint(digest) {
+                    results.push(true);
+                } else {
+                    results.push(false);
+                    fallback_keys.push(digest);
+                    fallback_indices.push(i);
+                }
+            }
+        }
+
+        let fallback_results = self
             .tables()?
             .builder_digest_to_checkpoint
-            .multi_contains_keys(digests)?)
+            .multi_contains_keys(fallback_keys)?;
+
+        assert_eq!(fallback_results.len(), fallback_indices.len());
+
+        for (result, i) in fallback_results
+            .into_iter()
+            .zip(fallback_indices.into_iter())
+        {
+            results[i] = result;
+        }
+
+        Ok(results)
     }
 
     pub fn get_last_checkpoint_signature_index(&self) -> SuiResult<u64> {
@@ -4147,7 +4182,15 @@ impl AuthorityPerEpochStore {
 /// for the commit have been certified.
 #[derive(Default)]
 pub(crate) struct ConsensusOutputQuarantine {
+    // Output from consensus handler
     output_queue: VecDeque<ConsensusCommitOutput>,
+
+    // Checkpoint Builder output
+    builder_checkpoint_summary:
+        BTreeMap<CheckpointSequenceNumber, (BuilderCheckpointSummary, CheckpointContents)>,
+    builder_digest_to_checkpoint: HashMap<TransactionDigest, CheckpointSequenceNumber>,
+
+    // Highest known certificated checkpoint sequence number
     finalized_checkpoint_sequence_number: Option<CheckpointSequenceNumber>,
 
     // Any un-committed next versions are stored here. A ref-count is used to
@@ -4203,11 +4246,8 @@ impl ConsensusOutputQuarantine {
         batch: &mut DBBatch,
     ) -> SuiResult {
         assert!(seq > 0);
-        let Some(builder_summary) = epoch_store
-            .tables()?
-            .builder_checkpoint_summary_v2
-            .get(&seq)?
-        else {
+
+        let Some((builder_summary, contents)) = self.builder_checkpoint_summary.remove(&seq) else {
             debug!(
                 "builder has not yet processed finalized checkpoint {:?} - skipping",
                 seq
@@ -4215,13 +4255,41 @@ impl ConsensusOutputQuarantine {
             return Ok(());
         };
 
+        let tables = epoch_store.tables()?;
+
+        batch.insert_batch(
+            &tables.builder_checkpoint_summary_v2,
+            [(seq, &builder_summary)],
+        )?;
+
+        for tx in contents.iter() {
+            let digest = &tx.transaction;
+            assert_eq!(
+                self.builder_digest_to_checkpoint
+                    .remove(digest)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "transaction {:?} not found in builder_digest_to_checkpoint",
+                            digest
+                        )
+                    }),
+                seq
+            );
+        }
+
+        batch.insert_batch(
+            &tables.builder_digest_to_checkpoint,
+            contents.iter().map(|tx| (tx.transaction, seq)),
+        )?;
+
         let height = builder_summary
             .checkpoint_height
             .expect("non-genesis checkpoint must have height");
-        self.commit_up_to_height(epoch_store, height, batch)
+
+        self.commit_consensus_up_to_height(epoch_store, height, batch)
     }
 
-    fn commit_up_to_height(
+    fn commit_consensus_up_to_height(
         &mut self,
         epoch_store: &AuthorityPerEpochStore,
         height: CheckpointHeight,
@@ -4421,6 +4489,43 @@ impl ConsensusOutputQuarantine {
             .rev()
             .filter_map(|output| output.get_randomness_last_round_timestamp())
             .next()
+    }
+}
+
+// Checkpoint builder methods
+impl ConsensusOutputQuarantine {
+    fn insert_builder_summary(
+        &mut self,
+        sequence_number: CheckpointSequenceNumber,
+        summary: BuilderCheckpointSummary,
+        contents: CheckpointContents,
+    ) {
+        for tx in contents.iter() {
+            self.builder_digest_to_checkpoint
+                .insert(tx.transaction, sequence_number);
+        }
+        self.builder_checkpoint_summary
+            .insert(sequence_number, (summary, contents));
+    }
+
+    fn last_built_summary(&self) -> Option<&BuilderCheckpointSummary> {
+        self.builder_checkpoint_summary
+            .values()
+            .last()
+            .map(|(summary, _)| summary)
+    }
+
+    fn get_built_summary(
+        &self,
+        sequence: CheckpointSequenceNumber,
+    ) -> Option<&BuilderCheckpointSummary> {
+        self.builder_checkpoint_summary
+            .get(&sequence)
+            .map(|(summary, _)| summary)
+    }
+
+    fn included_transaction_in_checkpoint(&self, digest: &TransactionDigest) -> bool {
+        self.builder_digest_to_checkpoint.contains_key(digest)
     }
 }
 
