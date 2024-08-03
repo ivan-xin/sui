@@ -75,8 +75,8 @@ use crate::epoch::reconfiguration::ReconfigState;
 use crate::execution_cache::ObjectCacheRead;
 use crate::module_cache_metrics::ResolverMetrics;
 use crate::post_consensus_tx_reorder::PostConsensusTxReorder;
+use crate::signature_verifier::*;
 use crate::stake_aggregator::{GenericMultiStakeAggregator, StakeAggregator};
-use crate::{epoch, signature_verifier::*};
 use move_bytecode_utils::module_cache::SyncModuleCache;
 use mysten_common::sync::notify_once::NotifyOnce;
 use mysten_common::sync::notify_read::NotifyRead;
@@ -1254,6 +1254,7 @@ impl AuthorityPerEpochStore {
             )?;
         }
 
+        // TODO: the key->digest mapping should probably be quarantined
         if !matches!(tx_key, TransactionKey::Digest(_)) {
             batch.insert_batch(&tables.transaction_key_to_digest, [(tx_key, tx_digest)])?;
         }
@@ -3895,6 +3896,7 @@ impl AuthorityPerEpochStore {
         commit_height: CheckpointHeight,
         content_info: Vec<(CheckpointSummary, CheckpointContents)>,
     ) {
+        let mut consensus_quarantine = self.consensus_quarantine.write();
         // All created checkpoints are inserted in builder_checkpoint_summary in a single batch.
         // This means that upon restart we can use BuilderCheckpointSummary::commit_height
         // from the last built summary to resume building checkpoints.
@@ -3906,12 +3908,13 @@ impl AuthorityPerEpochStore {
                 position_in_commit,
             };
 
-            self.consensus_quarantine.write().insert_builder_summary(
-                sequence_number,
-                summary,
-                transactions,
-            );
+            consensus_quarantine.insert_builder_summary(sequence_number, summary, transactions);
         }
+
+        // Because builder can run behind state sync, the data may be immediately ready to be committed.
+        consensus_quarantine
+            .commit_finalized_data(self)
+            .expect("commit cannot fail");
     }
 
     /// Register genesis checkpoint in builder DB
@@ -4195,8 +4198,8 @@ pub(crate) struct ConsensusOutputQuarantine {
 
     // Highest known certificated checkpoint sequence number
     finalized_checkpoint_sequence_number: Option<CheckpointSequenceNumber>,
-    // Highest checkpoint sequence number for which all data has been committed.
-    committed_checkpoint_sequence_number: CheckpointSequenceNumber,
+    // The next checkpoint sequence number to commit
+    next_checkpoint_sequence_to_commit: Option<CheckpointSequenceNumber>,
 
     // Any un-committed next versions are stored here. A ref-count is used to
     // evict keys when there is no longer
@@ -4226,7 +4229,10 @@ impl ConsensusOutputQuarantine {
         }
 
         self.finalized_checkpoint_sequence_number = Some(sequence_number);
-        self.commit_finalized_data_impl(sequence_number, epoch_store, batch)
+        if self.next_checkpoint_sequence_to_commit.is_none() {
+            self.next_checkpoint_sequence_to_commit = Some(sequence_number);
+        }
+        self.commit_finalized_data(epoch_store)
     }
 
     fn commit_finalized_data(&mut self, epoch_store: &AuthorityPerEpochStore) -> SuiResult {
@@ -4240,7 +4246,7 @@ impl ConsensusOutputQuarantine {
 
         self.commit_finalized_data_range(
             epoch_store,
-            self.committed_checkpoint_sequence_number,
+            self.next_checkpoint_sequence_to_commit.unwrap(),
             sequence_number,
         )
     }
@@ -4251,14 +4257,14 @@ impl ConsensusOutputQuarantine {
         from_seq: CheckpointSequenceNumber,
         to_seq: CheckpointSequenceNumber,
     ) -> SuiResult {
-        if from_seq == to_seq {
+        if from_seq > to_seq {
             return Ok(());
         }
 
         info!(?from_seq, ?to_seq, "Committing finalized data");
 
         let mut batch = epoch_store.db_batch()?;
-        for seq in (from_seq + 1)..=to_seq {
+        for seq in from_seq..=to_seq {
             self.commit_finalized_data_impl(seq, epoch_store, &mut batch)?;
         }
         batch.write()?;
@@ -4313,7 +4319,9 @@ impl ConsensusOutputQuarantine {
             .expect("non-genesis checkpoint must have height");
 
         self.commit_consensus_up_to_height(epoch_store, height, batch)?;
-        self.committed_checkpoint_sequence_number = seq;
+        let next_checkpoint_sequence_to_commit = seq + 1;
+        info!(?next_checkpoint_sequence_to_commit);
+        self.next_checkpoint_sequence_to_commit = Some(next_checkpoint_sequence_to_commit);
         Ok(())
     }
 
