@@ -214,11 +214,15 @@ impl TransactionInputLoader {
             });
         }
 
-        Ok(results
+        let ret = results
             .into_iter()
             .map(Option::unwrap)
             .collect::<Vec<_>>()
-            .into())
+            .into();
+
+        tracing::debug!("Read objects for execution: {:?}", ret);
+
+        Ok(ret)
     }
 }
 

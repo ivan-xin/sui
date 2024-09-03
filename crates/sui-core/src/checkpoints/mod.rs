@@ -1377,7 +1377,7 @@ impl CheckpointBuilder {
             }
 
             self.epoch_store
-                .consensus_messages_processed_notify(transaction_keys)
+                .consensus_messages_processed_notify_for_checkpoint(transaction_keys)
                 .await?;
         }
 

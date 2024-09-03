@@ -5075,9 +5075,10 @@ impl RandomnessRoundReceiver {
             let mut effects = result.unwrap_or_else(|_| panic!("failed to get effects for randomness state update transaction at epoch {epoch}, round {round}"));
             let effects = effects.pop().expect("should return effects");
             if *effects.status() != ExecutionStatus::Success {
+                error!("failed to execute randomness state update transaction at epoch {epoch}, round {round}: {effects:?}");
                 panic!("failed to execute randomness state update transaction at epoch {epoch}, round {round}: {effects:?}");
             }
-            debug!("successfully executed randomness state update transaction at epoch {epoch}, round {round}");
+            debug!("successfully executed randomness state update transaction at epoch {epoch}, round {round}: {effects:?}");
         });
     }
 }

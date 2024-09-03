@@ -441,7 +441,7 @@ impl CheckpointExecutor {
             .expect("commit_transaction_outputs cannot fail");
 
         epoch_store
-            .handle_committed_transactions(all_tx_digests)
+            .handle_finalized_checkpoint(checkpoint.data(), all_tx_digests)
             .expect("cannot fail");
 
         if !checkpoint.is_last_checkpoint_of_epoch() {

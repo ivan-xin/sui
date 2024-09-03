@@ -2983,7 +2983,7 @@ impl ObjectReadResult {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct InputObjects {
     objects: Vec<ObjectReadResult>,
 }
