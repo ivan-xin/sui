@@ -72,7 +72,7 @@ use crate::epoch::randomness::{
     VersionedUsedProcessedMessages, SINGLETON_KEY,
 };
 use crate::epoch::reconfiguration::ReconfigState;
-use crate::execution_cache::ObjectCacheRead;
+use crate::execution_cache::{ObjectCacheRead, TransactionCacheRead};
 use crate::module_cache_metrics::ResolverMetrics;
 use crate::post_consensus_tx_reorder::PostConsensusTxReorder;
 use crate::signature_verifier::*;
@@ -2675,6 +2675,7 @@ impl AuthorityPerEpochStore {
         consensus_stats: &ExecutionIndicesWithStats,
         checkpoint_service: &Arc<C>,
         cache_reader: &dyn ObjectCacheRead,
+        tx_reader: &dyn TransactionCacheRead,
         consensus_commit_info: &ConsensusCommitInfo,
         authority_metrics: &Arc<AuthorityMetrics>,
     ) -> SuiResult<Vec<VerifiedExecutableTransaction>> {
@@ -2877,6 +2878,8 @@ impl AuthorityPerEpochStore {
         self.finish_consensus_certificate_process_with_batch(&transactions_to_schedule)?;
         output.record_consensus_commit_stats(consensus_stats.clone());
 
+        let mut transactions_to_schedule = transactions_to_schedule;
+
         // Create pending checkpoints if we are still accepting tx.
         let should_accept_tx = if let Some(lock) = &lock {
             lock.should_accept_tx()
@@ -2927,10 +2930,21 @@ impl AuthorityPerEpochStore {
             // - Exception: if DKG fails, we always need to write out a PendingCheckpoint
             //   for randomness tx that are canceled.
             if let Some(randomness_round) = randomness_round {
-                randomness_roots.insert(TransactionKey::RandomnessRound(
-                    self.epoch(),
-                    randomness_round,
-                ));
+                let key = TransactionKey::RandomnessRound(self.epoch(), randomness_round);
+
+                // During crash recovery, the randomness update transaction may already have been
+                // created and executed before the crash. If it is available locally, we need to
+                // ensure it is executed.
+                if let Some(digest) = self.tables()?.transaction_key_to_digest.get(&key)? {
+                    if let Some(tx) = tx_reader.get_transaction_block(&digest)? {
+                        info!("Randomness update transaction {:?} already exists, scheduling for execution", digest);
+                        let tx =
+                            VerifiedExecutableTransaction::new_system((*tx).clone(), self.epoch());
+                        transactions_to_schedule.push(tx);
+                    }
+                }
+
+                randomness_roots.insert(key);
             }
             if randomness_round.is_some() || (dkg_failed && !randomness_roots.is_empty()) {
                 let pending_checkpoint = PendingCheckpointV2::V2(PendingCheckpointV2Contents {
@@ -3134,6 +3148,7 @@ impl AuthorityPerEpochStore {
         transactions: Vec<SequencedConsensusTransaction>,
         checkpoint_service: &Arc<C>,
         cache_reader: &dyn ObjectCacheRead,
+        tx_reader: &dyn TransactionCacheRead,
         authority_metrics: &Arc<AuthorityMetrics>,
         skip_consensus_commit_prologue_in_test: bool,
     ) -> SuiResult<Vec<VerifiedExecutableTransaction>> {
@@ -3142,6 +3157,7 @@ impl AuthorityPerEpochStore {
             &ExecutionIndicesWithStats::default(),
             checkpoint_service,
             cache_reader,
+            tx_reader,
             &ConsensusCommitInfo::new_for_test(
                 if self.randomness_state_enabled() {
                     self.get_highest_pending_checkpoint_height() / 2 + 1
