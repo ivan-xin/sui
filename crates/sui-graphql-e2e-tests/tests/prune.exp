@@ -1,4 +1,4 @@
-processed 13 tasks
+processed 14 tasks
 
 task 1, lines 6-25:
 //# publish
@@ -48,7 +48,11 @@ task 10, line 43:
 //# advance-epoch
 Epoch advanced: 2
 
-task 11, lines 45-55:
+task 11, line 45:
+//# create-checkpoint
+Checkpoint created: 7
+
+task 12, lines 47-57:
 //# run-graphql
 Response: {
   "data": {
@@ -95,16 +99,25 @@ Response: {
             "epochId": 2
           },
           "sequenceNumber": 6
+        },
+        {
+          "epoch": {
+            "epochId": 3
+          },
+          "sequenceNumber": 7
         }
       ]
     }
   }
 }
 
-task 12, lines 58-68:
+task 13, lines 60-73:
 //# run-graphql --wait-for-checkpoint-pruned 0
 Response: {
   "data": {
+    "epoch": {
+      "epochId": 3
+    },
     "checkpoints": {
       "nodes": [
         {
@@ -118,6 +131,12 @@ Response: {
             "epochId": 2
           },
           "sequenceNumber": 6
+        },
+        {
+          "epoch": {
+            "epochId": 3
+          },
+          "sequenceNumber": 7
         }
       ]
     }
