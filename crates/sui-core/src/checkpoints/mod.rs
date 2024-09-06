@@ -2184,9 +2184,8 @@ impl CheckpointService {
 
         let mut output = ConsensusCommitOutput::new();
         epoch_store.write_pending_checkpoint(&mut output, &checkpoint)?;
-        let mut batch = epoch_store.db_batch_for_test();
-        output.write_to_batch(epoch_store, &mut batch)?;
-        batch.write()?;
+        output.set_default_commit_stats_for_testing();
+        epoch_store.push_consensus_output_for_tests(output);
         self.notify_checkpoint()?;
         Ok(())
     }

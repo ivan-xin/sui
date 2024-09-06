@@ -2422,11 +2422,11 @@ impl AuthorityPerEpochStore {
             .insert(digest, signatures);
         let key = ConsensusTransactionKey::Certificate(digest);
         let key = SequencedConsensusTransactionKey::External(key);
-        self.tables()
-            .expect("test should not cross epoch boundary")
-            .consensus_message_processed
-            .insert(&key, &true)
-            .unwrap();
+
+        let mut output = ConsensusCommitOutput::default();
+        output.record_consensus_message_processed(key.clone());
+        output.set_default_commit_stats_for_testing();
+        self.consensus_quarantine.write().push(output);
         self.consensus_notify_read.notify(&key, &());
     }
 
@@ -3109,6 +3109,11 @@ impl AuthorityPerEpochStore {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
+    pub fn push_consensus_output_for_tests(&self, output: ConsensusCommitOutput) {
+        self.consensus_quarantine.write().push(output);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn get_highest_pending_checkpoint_height(&self) -> CheckpointHeight {
         self.consensus_quarantine
             .read()
@@ -3188,6 +3193,7 @@ impl AuthorityPerEpochStore {
         )
         .await?;
         let mut batch = self.db_batch()?;
+        output.set_default_commit_stats_for_testing();
         output.write_to_batch(self, &mut batch)?;
         batch.write()?;
         Ok(())
@@ -4673,6 +4679,12 @@ impl ConsensusCommitOutput {
 
     fn record_consensus_commit_stats(&mut self, stats: ExecutionIndicesWithStats) {
         self.consensus_commit_stats = Some(stats);
+    }
+
+    // in testing code we often need to write to the db outside of a consensus commit
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn set_default_commit_stats_for_testing(&mut self) {
+        self.record_consensus_commit_stats(Default::default());
     }
 
     fn store_reconfig_state(&mut self, state: ReconfigState) {
