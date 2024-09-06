@@ -1791,27 +1791,6 @@ impl AuthorityPerEpochStore {
             txns.push((*key, transactions.clone()));
         }
 
-        /*
-        let tables = self.tables()?;
-
-        self.tables()?
-            .deferred_transactions
-            .safe_iter_with_bounds(Some(min), Some(max))
-            .try_for_each(|result| match result {
-                Ok((key, txs)) => {
-                    debug!(
-                        "Loaded {:?} deferred txn with deferral key {:?}",
-                        txs.len(),
-                        key
-                    );
-                    keys.push(key);
-                    txns.push((key, txs));
-                    Ok(())
-                }
-                Err(err) => Err(err),
-            })?;
-        */
-
         // verify that there are no duplicates - should be impossible due to
         // is_consensus_message_processed
         #[cfg(debug_assertions)]
@@ -1835,12 +1814,12 @@ impl AuthorityPerEpochStore {
 
     pub fn get_all_deferred_transactions_for_test(
         &self,
-    ) -> SuiResult<Vec<(DeferralKey, Vec<VerifiedSequencedConsensusTransaction>)>> {
-        Ok(self
-            .tables()?
-            .deferred_transactions
-            .safe_iter()
-            .collect::<Result<Vec<_>, _>>()?)
+    ) -> Vec<(DeferralKey, Vec<VerifiedSequencedConsensusTransaction>)> {
+        self.deferred_transactions
+            .lock()
+            .iter()
+            .map(|(key, txs)| (*key, txs.clone()))
+            .collect()
     }
 
     fn get_max_accumulated_txn_cost_per_object_in_commit(&self) -> Option<u64> {
