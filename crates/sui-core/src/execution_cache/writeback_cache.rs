@@ -834,6 +834,10 @@ impl WritebackCache {
         }
 
         self.metrics.record_cache_write("executed_effects_digests");
+        debug!(
+            "writing executed effects digest and notifying {:?}",
+            tx_digest
+        );
         self.dirty
             .executed_effects_digests
             .insert(tx_digest, effects_digest);

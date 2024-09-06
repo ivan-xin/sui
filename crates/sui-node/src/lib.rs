@@ -1563,6 +1563,8 @@ impl SuiNode {
                     .submit(transaction, None, &cur_epoch_store)?;
             }
 
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
             let stop_condition = checkpoint_executor
                 .run_epoch(cur_epoch_store.clone(), run_with_range)
                 .await;

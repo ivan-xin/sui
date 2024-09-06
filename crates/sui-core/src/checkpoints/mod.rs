@@ -364,13 +364,16 @@ impl CheckpointStore {
         &self,
     ) -> Result<Option<VerifiedCheckpoint>, TypedStoreError> {
         let highest_executed = if let Some(highest_executed) =
-            self.watermarks.get(&CheckpointWatermark::HighestExecuted)?
+            dbg!(self.watermarks.get(&CheckpointWatermark::HighestExecuted))?
         {
+            info!("Highest executed checkpoint: {:?}", highest_executed);
             highest_executed
         } else {
             return Ok(None);
         };
-        self.get_checkpoint_by_digest(&highest_executed.1)
+        let ret = self.get_checkpoint_by_digest(&highest_executed.1)?;
+        info!("Highest executed checkpoint: {:?}", ret);
+        Ok(ret)
     }
 
     pub fn get_highest_pruned_checkpoint_seq_number(
@@ -867,6 +870,7 @@ impl CheckpointBuilder {
             .into_iter()
             .peekable();
         while let Some((height, pending)) = checkpoints_iter.next() {
+            debug!("Processing pending checkpoint {:?}", height);
             // Group PendingCheckpoints until:
             // - minimum interval has elapsed ...
             let current_timestamp = pending.details().timestamp_ms;
@@ -958,6 +962,8 @@ impl CheckpointBuilder {
             .checkpoint_roots_count
             .inc_by(roots.len() as u64);
 
+        debug!("resolving roots {:?}", roots);
+
         let root_digests = self
             .epoch_store
             .notify_read_executed_digests(&roots)
@@ -968,6 +974,8 @@ impl CheckpointBuilder {
             .notify_read_executed_effects(&root_digests)
             .in_monitored_scope("CheckpointNotifyRead")
             .await?;
+
+        debug!("resolved {} root transactions", root_digests.len());
 
         let _scope = monitored_scope("CheckpointBuilder");
 
@@ -2313,6 +2321,8 @@ mod tests {
             .build()
             .await;
 
+        info!("HAY");
+
         let dummy_tx = VerifiedTransaction::new_genesis_transaction(vec![]);
         let dummy_tx_with_data =
             VerifiedTransaction::new_genesis_transaction(vec![GenesisObject::RawObject {
@@ -2450,7 +2460,9 @@ mod tests {
             .unwrap();
 
         let (c1c, c1s) = result.recv().await.unwrap();
+        info!("HAY");
         let (c2c, c2s) = result.recv().await.unwrap();
+        info!("HAY");
 
         let c1t = c1c.iter().map(|d| d.transaction).collect::<Vec<_>>();
         let c2t = c2c.iter().map(|d| d.transaction).collect::<Vec<_>>();
@@ -2473,8 +2485,10 @@ mod tests {
         // Pending at index 2 had 4 transactions, and we configured 3 transactions max.
         // Verify that we split into 2 checkpoints.
         let (c3c, c3s) = result.recv().await.unwrap();
+        info!("HAY");
         let c3t = c3c.iter().map(|d| d.transaction).collect::<Vec<_>>();
         let (c4c, c4s) = result.recv().await.unwrap();
+        info!("HAY");
         let c4t = c4c.iter().map(|d| d.transaction).collect::<Vec<_>>();
         assert_eq!(c3s.sequence_number, 2);
         assert_eq!(c3s.previous_digest, Some(c2s.digest()));
@@ -2486,8 +2500,10 @@ mod tests {
         // Pending at index 3 had 3 transactions of 40K size, and we configured 100K max.
         // Verify that we split into 2 checkpoints.
         let (c5c, c5s) = result.recv().await.unwrap();
+        info!("HAY");
         let c5t = c5c.iter().map(|d| d.transaction).collect::<Vec<_>>();
         let (c6c, c6s) = result.recv().await.unwrap();
+        info!("HAY");
         let c6t = c6c.iter().map(|d| d.transaction).collect::<Vec<_>>();
         assert_eq!(c5s.sequence_number, 4);
         assert_eq!(c5s.previous_digest, Some(c4s.digest()));
@@ -2499,6 +2515,7 @@ mod tests {
         // Pending at index 4 was too soon after the prior one and should be coalesced into
         // the next one.
         let (c7c, c7s) = result.recv().await.unwrap();
+        info!("HAY");
         let c7t = c7c.iter().map(|d| d.transaction).collect::<Vec<_>>();
         assert_eq!(c7t, vec![d(5), d(6)]);
         assert_eq!(c7s.previous_digest, Some(c6s.digest()));
@@ -2521,7 +2538,9 @@ mod tests {
             .unwrap();
 
         let c1sc = certified_result.recv().await.unwrap();
+        info!("HAY");
         let c2sc = certified_result.recv().await.unwrap();
+        info!("HAY");
         assert_eq!(c1sc.sequence_number, 0);
         assert_eq!(c2sc.sequence_number, 1);
     }

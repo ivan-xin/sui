@@ -1,6 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::time::Duration;
+
 use sui_macros::sim_test;
 use sui_rest_api::client::BalanceChange;
 use sui_rest_api::Client;
@@ -18,6 +20,8 @@ async fn execute_transaction_transfer() {
     let client = Client::new(test_cluster.rpc_url());
     let address = SuiAddress::random_for_testing_only();
     let amount = 9;
+
+    tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let txn =
         make_transfer_sui_transaction(&test_cluster.wallet, Some(address), Some(amount)).await;
