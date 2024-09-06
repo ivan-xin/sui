@@ -44,10 +44,6 @@ impl Pruner {
 
             let (mut min_epoch, mut max_epoch) = self.store.get_available_epoch_range().await?;
             while min_epoch + self.epochs_to_keep > max_epoch {
-                println!(
-                    "in while loop: min_epoch={}, max_epoch={}",
-                    min_epoch, max_epoch
-                );
                 if cancel.is_cancelled() {
                     info!("Pruner task cancelled.");
                     return Ok(());
@@ -78,7 +74,6 @@ impl Pruner {
                 // drop partitions if pruning is enabled afterwards, where all epochs before min_epoch
                 // would have been pruned already if the pruner was running.
                 for epoch in *min_partition..min_epoch {
-                    println!("dropping table partition {} epoch {}", table_name, epoch);
                     self.partition_manager
                         .drop_table_partition(table_name.clone(), epoch)?;
                     info!(
@@ -89,7 +84,6 @@ impl Pruner {
             }
 
             for epoch in min_epoch..max_epoch.saturating_sub(self.epochs_to_keep - 1) {
-                println!("in for loop: pruning other data for epoch={}", epoch);
                 if cancel.is_cancelled() {
                     info!("Pruner task cancelled.");
                     return Ok(());
