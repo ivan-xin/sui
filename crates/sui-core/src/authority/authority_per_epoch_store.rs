@@ -3968,20 +3968,16 @@ impl AuthorityPerEpochStore {
         if let Some(BuilderCheckpointSummary { summary, .. }) =
             self.consensus_quarantine.read().last_built_summary()
         {
-            let ret = Ok(Some((*summary.sequence_number(), summary.clone())));
-            debug!(?ret, "last_built_checkpoint_summary");
-            return ret;
+            return Ok(Some((*summary.sequence_number(), summary.clone())));
         }
 
-        let ret = self
+        Ok(self
             .tables()?
             .builder_checkpoint_summary_v2
             .unbounded_iter()
             .skip_to_last()
             .next()
-            .map(|(seq, s)| (seq, s.summary));
-        debug!(?ret, "last_built_checkpoint_summary");
-        return Ok(ret);
+            .map(|(seq, s)| (seq, s.summary)))
     }
 
     pub fn get_built_checkpoint_summary(
@@ -4233,10 +4229,21 @@ impl ConsensusOutputQuarantine {
         if self.next_checkpoint_sequence_to_commit.is_none() {
             self.next_checkpoint_sequence_to_commit = Some(sequence_number);
         }
-        self.commit_finalized_data(epoch_store)
+        self.commit_finalized_data_with_batch(epoch_store, batch)
     }
 
     fn commit_finalized_data(&mut self, epoch_store: &AuthorityPerEpochStore) -> SuiResult {
+        let mut batch = epoch_store.db_batch()?;
+        self.commit_finalized_data_with_batch(epoch_store, &mut batch)?;
+        batch.write()?;
+        Ok(())
+    }
+
+    fn commit_finalized_data_with_batch(
+        &mut self,
+        epoch_store: &AuthorityPerEpochStore,
+        batch: &mut DBBatch,
+    ) -> SuiResult {
         let Some(sequence_number) = self.finalized_checkpoint_sequence_number else {
             return Ok(());
         };
@@ -4245,30 +4252,19 @@ impl ConsensusOutputQuarantine {
             return Ok(());
         }
 
-        self.commit_finalized_data_range(
-            epoch_store,
-            self.next_checkpoint_sequence_to_commit.unwrap(),
-            sequence_number,
-        )
-    }
+        let from_seq = self.next_checkpoint_sequence_to_commit.unwrap();
+        let to_seq = sequence_number;
 
-    fn commit_finalized_data_range(
-        &mut self,
-        epoch_store: &AuthorityPerEpochStore,
-        from_seq: CheckpointSequenceNumber,
-        to_seq: CheckpointSequenceNumber,
-    ) -> SuiResult {
         if from_seq > to_seq {
             return Ok(());
         }
 
         info!(?from_seq, ?to_seq, "Committing finalized data");
 
-        let mut batch = epoch_store.db_batch()?;
         for seq in from_seq..=to_seq {
-            self.commit_finalized_data_impl(seq, epoch_store, &mut batch)?;
+            self.commit_finalized_data_impl(seq, epoch_store, batch)?;
         }
-        batch.write()?;
+
         Ok(())
     }
 
@@ -4355,7 +4351,9 @@ impl ConsensusOutputQuarantine {
 
         Ok(())
     }
+}
 
+impl ConsensusOutputQuarantine {
     fn is_consensus_message_processed(&self, key: &SequencedConsensusTransactionKey) -> bool {
         self.output_queue
             .iter()
