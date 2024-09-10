@@ -203,6 +203,10 @@ where
         let store_path = context.parameters.db_path.as_path().to_str().unwrap();
         let store = Arc::new(RocksDBStore::new(store_path));
         let dag_state = Arc::new(RwLock::new(DagState::new(context.clone(), store.clone())));
+        if let Some(last_known_commit_info) = dag_state.read().recover_last_commit_info() {
+            last_known_commit_info.0.index;
+        }
+
         let sync_last_known_own_block = boot_counter == 0
             && dag_state.read().highest_accepted_round() == 0
             && !context
