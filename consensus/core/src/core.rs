@@ -687,7 +687,12 @@ impl Core {
                         if let Some(last_block_ref) = self.last_included_ancestors[block.author()] {
                             return (last_block_ref.round < block.round()).then_some(block);
                         }
-                        Some(block)
+
+                        if block.round() == clock_round - 1 {
+                            Some(block)
+                        } else {
+                            None
+                        }
                     }),
             )
             .collect::<Vec<_>>();
