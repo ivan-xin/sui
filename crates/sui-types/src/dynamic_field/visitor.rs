@@ -5,6 +5,7 @@ use move_core_types::{
     account_address::AccountAddress,
     annotated_value as A,
     annotated_visitor::{self, StructDriver, ValueDriver, VariantDriver, VecDriver, Visitor},
+    language_storage::TypeTag,
     u256::U256,
 };
 
@@ -31,6 +32,12 @@ pub enum Error {
     #[error("Not a dynamic field")]
     NotADynamicField,
 
+    #[error("Not a dynamic object field")]
+    NotADynamicObjectField,
+
+    #[error("Dynamic object field with value at: {}", .0.to_canonical_display(/* with_prefix */ true))]
+    DynamicObjectField(ObjectID),
+
     #[error("{0}")]
     Visitor(#[from] annotated_visitor::Error),
 }
@@ -43,6 +50,22 @@ impl FieldVisitor {
         layout: &'l A::MoveTypeLayout,
     ) -> anyhow::Result<Field<'b, 'l>> {
         A::MoveValue::visit_deserialize(bytes, layout, &mut FieldVisitor)
+    }
+}
+
+impl<'b, 'l> Field<'b, 'l> {
+    /// If this field is a dynamic field, returns its value's type. If it is a dynamic object
+    /// field, it returns the ID of the object the value points to (which must be fetched to
+    /// extract its type).
+    pub fn value_type(&self) -> Result<TypeTag, Error> {
+        match self.kind {
+            DynamicFieldType::DynamicField => Ok(TypeTag::from(self.value_layout)),
+            DynamicFieldType::DynamicObject => {
+                let id: ObjectID = bcs::from_bytes(&self.value_bytes)
+                    .map_err(|_| Error::NotADynamicObjectField)?;
+                Err(Error::DynamicObjectField(id))
+            }
+        }
     }
 }
 
