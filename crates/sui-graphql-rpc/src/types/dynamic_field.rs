@@ -107,7 +107,7 @@ impl DynamicField {
             .extend()?;
 
         if kind == DynamicFieldType::DynamicObject {
-            let df_object_id: SuiAddress = bcs::from_bytes(&value_bytes)
+            let df_object_id: SuiAddress = bcs::from_bytes(value_bytes)
                 .map_err(|e| Error::Internal(format!("Failed to deserialize object ID: {e}")))
                 .extend()?;
 
