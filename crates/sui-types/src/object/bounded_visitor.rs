@@ -505,7 +505,7 @@ pub(crate) mod tests {
     }
 
     /// Create a struct layout for test purposes.
-    pub(crate) fn layout_(rep: &str, fields: Vec<FieldLayout>) -> A::MoveTypeLayout {
+    pub(crate) fn layout_(rep: &str, fields: Vec<FieldLayout<'_>>) -> A::MoveTypeLayout {
         let type_ = StructTag::from_str(rep).unwrap();
         let fields = fields
             .into_iter()
@@ -542,7 +542,7 @@ pub(crate) mod tests {
     /// Create an enum layout for test purposes.
     pub(crate) fn enum_(
         rep: &str,
-        variants: Vec<(Variant, Vec<FieldLayout>)>,
+        variants: Vec<(Variant<'_>, Vec<FieldLayout<'_>>)>,
     ) -> A::MoveTypeLayout {
         let type_ = StructTag::from_str(rep).unwrap();
         let variants = variants
