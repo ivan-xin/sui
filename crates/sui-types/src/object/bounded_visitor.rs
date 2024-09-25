@@ -486,6 +486,9 @@ pub(crate) mod tests {
         expect.assert_eq(&err.to_string());
     }
 
+    type Variant<'s> = (&'s str, u16);
+    type FieldLayout<'s> = (&'s str, A::MoveTypeLayout);
+
     fn ident_(name: &str) -> Identifier {
         Identifier::new(name).unwrap()
     }
@@ -502,7 +505,7 @@ pub(crate) mod tests {
     }
 
     /// Create a struct layout for test purposes.
-    pub(crate) fn layout_(rep: &str, fields: Vec<(&str, A::MoveTypeLayout)>) -> A::MoveTypeLayout {
+    pub(crate) fn layout_(rep: &str, fields: Vec<FieldLayout>) -> A::MoveTypeLayout {
         let type_ = StructTag::from_str(rep).unwrap();
         let fields = fields
             .into_iter()
@@ -539,7 +542,7 @@ pub(crate) mod tests {
     /// Create an enum layout for test purposes.
     pub(crate) fn enum_(
         rep: &str,
-        variants: Vec<((&str, u16), Vec<(&str, A::MoveTypeLayout)>)>,
+        variants: Vec<(Variant, Vec<FieldLayout>)>,
     ) -> A::MoveTypeLayout {
         let type_ = StructTag::from_str(rep).unwrap();
         let variants = variants
