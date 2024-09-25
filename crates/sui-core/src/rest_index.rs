@@ -679,11 +679,13 @@ fn try_create_dynamic_field_info(
     let field = DFV::FieldVisitor::deserialize(move_object.contents(), &layout)
         .map_err(StorageError::custom)?;
 
+    let value_metadata = field.value_metadata().map_err(StorageError::custom)?;
+
     Ok(Some(DynamicFieldIndexInfo {
         name_type: field.name_layout.into(),
         name_value: field.name_bytes.to_owned(),
         dynamic_field_type: field.kind,
-        dynamic_object_id: if let Err(DFV::Error::DynamicObjectField(id)) = field.value_type() {
+        dynamic_object_id: if let DFV::ValueMetadata::DynamicObjectField(id) = value_metadata {
             Some(id)
         } else {
             None
