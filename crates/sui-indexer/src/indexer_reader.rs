@@ -9,9 +9,7 @@ use diesel::{
 };
 use itertools::Itertools;
 use std::sync::Arc;
-use sui_types::dynamic_field;
-use sui_types::dynamic_field::visitor::FieldVisitor;
-use sui_types::dynamic_field::visitor::ValueMetadata;
+use sui_types::dynamic_field::visitor as DFV;
 use sui_types::object::bounded_visitor::BoundedVisitor;
 use tap::{Pipe, TapFallible};
 use tracing::{debug, error, warn};
@@ -1247,8 +1245,8 @@ impl IndexerReader {
                 ))
             })?;
 
-        let field =
-            FieldVisitor::deserialize(move_object.contents(), &layout).tap_err(|e| warn!("{e}"))?;
+        let field = DFV::FieldVisitor::deserialize(move_object.contents(), &layout)
+            .tap_err(|e| warn!("{e}"))?;
 
         let type_ = field.kind;
         let name_type: TypeTag = field.name_layout.into();
@@ -1268,7 +1266,7 @@ impl IndexerReader {
         })?;
 
         Ok(Some(match value_metadata {
-            ValueMetadata::DynamicField(object_type) => DynamicFieldInfo {
+            DFV::ValueMetadata::DynamicField(object_type) => DynamicFieldInfo {
                 name,
                 bcs_name,
                 type_,
@@ -1278,7 +1276,7 @@ impl IndexerReader {
                 digest: object.digest(),
             },
 
-            ValueMetadata::DynamicObjectField(object_id) => {
+            DFV::ValueMetadata::DynamicObjectField(object_id) => {
                 let object = self.get_object(&object_id, None).await?.ok_or_else(|| {
                     IndexerError::UncategorizedError(anyhow!(
                         "Failed to find object_id {} when trying to create dynamic field info",
