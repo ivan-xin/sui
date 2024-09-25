@@ -27,6 +27,11 @@ pub struct Field<'b, 'l> {
     pub value_bytes: &'b [u8],
 }
 
+pub enum ValueMetadata {
+    DynamicField(TypeTag),
+    DynamicObjectField(ObjectID),
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("Not a dynamic field")]
@@ -34,9 +39,6 @@ pub enum Error {
 
     #[error("Not a dynamic object field")]
     NotADynamicObjectField,
-
-    #[error("Dynamic object field with value at: {}", .0.to_canonical_display(/* with_prefix */ true))]
-    DynamicObjectField(ObjectID),
 
     #[error("{0}")]
     Visitor(#[from] annotated_visitor::Error),
@@ -57,13 +59,16 @@ impl<'b, 'l> Field<'b, 'l> {
     /// If this field is a dynamic field, returns its value's type. If it is a dynamic object
     /// field, it returns the ID of the object the value points to (which must be fetched to
     /// extract its type).
-    pub fn value_type(&self) -> Result<TypeTag, Error> {
+    pub fn value_metadata(&self) -> Result<ValueMetadata, Error> {
         match self.kind {
-            DynamicFieldType::DynamicField => Ok(TypeTag::from(self.value_layout)),
+            DynamicFieldType::DynamicField => Ok(ValueMetadata::DynamicField(TypeTag::from(
+                self.value_layout,
+            ))),
+
             DynamicFieldType::DynamicObject => {
                 let id: ObjectID = bcs::from_bytes(&self.value_bytes)
                     .map_err(|_| Error::NotADynamicObjectField)?;
-                Err(Error::DynamicObjectField(id))
+                Ok(ValueMetadata::DynamicObjectField(id))
             }
         }
     }
