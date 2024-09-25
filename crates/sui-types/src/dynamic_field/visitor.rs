@@ -66,8 +66,8 @@ impl<'b, 'l> Field<'b, 'l> {
             ))),
 
             DynamicFieldType::DynamicObject => {
-                let id: ObjectID = bcs::from_bytes(&self.value_bytes)
-                    .map_err(|_| Error::NotADynamicObjectField)?;
+                let id: ObjectID =
+                    bcs::from_bytes(self.value_bytes).map_err(|_| Error::NotADynamicObjectField)?;
                 Ok(ValueMetadata::DynamicObjectField(id))
             }
         }
