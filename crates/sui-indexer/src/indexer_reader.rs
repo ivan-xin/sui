@@ -11,6 +11,7 @@ use itertools::Itertools;
 use std::sync::Arc;
 use sui_types::dynamic_field;
 use sui_types::dynamic_field::visitor::FieldVisitor;
+use sui_types::dynamic_field::visitor::ValueMetadata;
 use sui_types::object::bounded_visitor::BoundedVisitor;
 use tap::{Pipe, TapFallible};
 use tracing::{debug, error, warn};
@@ -1261,8 +1262,13 @@ impl IndexerReader {
             value: SuiMoveValue::from(name_value).to_json_value(),
         };
 
-        Ok(Some(match field.value_type() {
-            Ok(object_type) => DynamicFieldInfo {
+        let value_metadata = field.value_metadata().map_err(|e| {
+            warn!("{e}");
+            IndexerError::UncategorizedError(anyhow!(e))
+        })?;
+
+        Ok(Some(match value_metadata {
+            ValueMetadata::DynamicField(object_type) => DynamicFieldInfo {
                 name,
                 bcs_name,
                 type_,
@@ -1272,7 +1278,7 @@ impl IndexerReader {
                 digest: object.digest(),
             },
 
-            Err(dynamic_field::visitor::Error::DynamicObjectField(object_id)) => {
+            ValueMetadata::DynamicObjectField(object_id) => {
                 let object = self.get_object(&object_id, None).await?.ok_or_else(|| {
                     IndexerError::UncategorizedError(anyhow!(
                         "Failed to find object_id {} when trying to create dynamic field info",
@@ -1290,11 +1296,6 @@ impl IndexerReader {
                     version: object.version(),
                     digest: object.digest(),
                 }
-            }
-
-            Err(e) => {
-                warn!("{e}");
-                return Err(IndexerError::UncategorizedError(anyhow!(e)));
             }
         }))
     }
