@@ -104,14 +104,14 @@ impl<'b, 'l> Visitor<'b, 'l> for FieldVisitor {
             return Err(Error::NotADynamicField);
         };
 
-        return Ok(Field {
+        Ok(Field {
             id,
             kind,
             name_layout,
             name_bytes,
             value_layout,
             value_bytes,
-        });
+        })
     }
 
     // === Empty/default casees ===
@@ -193,7 +193,7 @@ fn extract_name_layout(
         return Err(Error::NotADynamicField);
     }
 
-    return Ok((DynamicFieldType::DynamicObject, layout));
+    Ok((DynamicFieldType::DynamicObject, layout))
 }
 
 #[cfg(test)]
