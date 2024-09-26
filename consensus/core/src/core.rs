@@ -19,18 +19,19 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
+    ancestor::{AncestorState, AncestorStateManager},
     block::{
         Block, BlockAPI, BlockRef, BlockTimestampMs, BlockV1, Round, SignedBlock, Slot,
         VerifiedBlock, GENESIS_ROUND,
     },
     block_manager::BlockManager,
-    commit::{CommitRange, CommittedSubDag},
+    commit::CommittedSubDag,
     commit_observer::CommitObserver,
     context::Context,
     dag_state::DagState,
     error::{ConsensusError, ConsensusResult},
     leader_schedule::LeaderSchedule,
-    leader_scoring::ReputationScores,
+    round_prober::QuorumRound,
     stake_aggregator::{QuorumThreshold, StakeAggregator},
     threshold_clock::ThresholdClock,
     transaction::TransactionConsumer,
@@ -61,13 +62,13 @@ pub(crate) struct Core {
     /// Core stops proposing new blocks when there is no subscriber, because new proposed blocks
     /// will likely contain only stale info when they propagate to peers.
     subscriber_exists: bool,
-    /// Estimated delay by round per authority for propagating blocks to a quorum.
+    /// Estimated delay by round for propagating blocks to a quorum.
     /// Because of the nature of TCP and block streaming, propagation delay is expected to be
     /// 0 in most cases, even when the actual latency of broadcasting blocks is high.
-    /// When this value for our own index is higher than the `propagation_delay_stop_proposal_threshold`,
-    /// most likely this validator cannot broadcast blocks to the network at all.
+    /// When this value is higher than the `propagation_delay_stop_proposal_threshold`,
+    /// most likely this validator cannot broadcast  blocks to the network at all.
     /// Core stops proposing new blocks in this case.
-    propagation_delay_per_authority: Vec<Round>,
+    propagation_delay: Round,
 
     /// Used to make commit decisions for leader blocks in the dag.
     committer: UniversalCommitter,
@@ -99,7 +100,7 @@ pub(crate) struct Core {
     /// the last block sync mechanism is enabled, but it hasn't been initialised yet.
     last_known_proposed_round: Option<Round>,
 
-    peer_quorum_propogation_scores: ReputationScores,
+    ancestor_state_manager: AncestorStateManager,
 }
 
 impl Core {
@@ -154,6 +155,13 @@ impl Core {
             Some(0)
         };
 
+        let propagation_scores = leader_schedule
+            .leader_swap_table
+            .read()
+            .reputation_scores
+            .clone();
+        let ancestor_state_manager = AncestorStateManager::new(context.clone(), propagation_scores);
+
         Self {
             context: context.clone(),
             threshold_clock: ThresholdClock::new(0, context.clone()),
@@ -164,15 +172,14 @@ impl Core {
             transaction_consumer,
             block_manager,
             subscriber_exists,
-            propagation_delay_per_authority: vec![0; context.committee.size()],
+            propagation_delay: 0,
             committer,
             commit_observer,
             signals,
             block_signer,
             dag_state,
             last_known_proposed_round: min_propose_round,
-            // TODO(arun): Store and restore propogation scores with leader scores.
-            peer_quorum_propogation_scores: ReputationScores::new(CommitRange::default(), vec![]),
+            ancestor_state_manager,
         }
         .recover()
     }
@@ -581,15 +588,17 @@ impl Core {
                         .protocol_config
                         .consensus_distributed_vote_scoring_strategy()
                     {
-                        self.peer_quorum_propogation_scores = {
-                            let guard = self.dag_state.read();
-                            // TODO: Confirm distrubted vote scoring is best
-                            // guard.calculate_scoring_subdag_certified_vote_scores()
-                            guard.calculate_scoring_subdag_distributed_vote_scores()
-                        };
-
                         self.leader_schedule
                             .update_leader_schedule_v2(&self.dag_state);
+
+                        let propagation_scores = self
+                            .leader_schedule
+                            .leader_swap_table
+                            .read()
+                            .reputation_scores
+                            .clone();
+                        self.ancestor_state_manager
+                            .set_propagation_scores(propagation_scores);
                     } else {
                         self.leader_schedule
                             .update_leader_schedule_v1(&self.dag_state);
@@ -677,10 +686,36 @@ impl Core {
         self.subscriber_exists = exists;
     }
 
-    /// Sets the delay by round per authority for propagating blocks to a quorum.
-    pub(crate) fn set_propagation_delay_per_authority(&mut self, delay_per_authority: Vec<Round>) {
-        info!("Propagation round delay per authority set to: {delay_per_authority:?}");
-        self.propagation_delay_per_authority = delay_per_authority;
+    /// Sets the propagation delay for propagating blocks to a quorum and the
+    /// quorum round per authority for ancestor state manager.
+    pub(crate) fn set_propagation_delay_and_quorum_rounds(
+        &mut self,
+        quorum_rounds: Vec<QuorumRound>,
+    ) {
+        let own_index = self.context.own_index;
+        let last_proposed_round = self
+            .dag_state
+            .read()
+            .get_last_block_for_authority(own_index)
+            .round();
+        let propagation_delay = last_proposed_round.saturating_sub(quorum_rounds[own_index].0);
+
+        info!("Quorum round per authority in ancestor state manager set to: {quorum_rounds:?}");
+        self.ancestor_state_manager
+            .set_quorum_round_per_authority(quorum_rounds);
+        self.context
+            .metrics
+            .node_metrics
+            .round_prober_propagation_delays
+            .observe(propagation_delay as f64);
+        self.context
+            .metrics
+            .node_metrics
+            .round_prober_last_propagation_delay
+            .set(propagation_delay as i64);
+
+        info!("Propagation round delay for own authority set to: {propagation_delay}");
+        self.propagation_delay = propagation_delay;
     }
 
     /// Sets the min propose round for the proposer allowing to propose blocks only for round numbers
@@ -707,7 +742,7 @@ impl Core {
             return false;
         }
 
-        if self.propagation_delay_per_authority[self.context.own_index]
+        if self.propagation_delay
             > self
                 .context
                 .parameters
@@ -715,7 +750,7 @@ impl Core {
         {
             debug!(
                 "Skip proposing for round {clock_round}, high propagation delay {} > {}.",
-                self.propagation_delay_per_authority[self.context.own_index],
+                self.propagation_delay,
                 self.context
                     .parameters
                     .propagation_delay_stop_proposal_threshold
@@ -819,47 +854,41 @@ impl Core {
             "Fatal error, number of returned ancestors don't match committee size."
         );
 
-        // TODO(arun): Set as const or protocol config
-        let bottom_percentage = 10;
-        let scores = self.peer_quorum_propogation_scores.clone();
-        // TODO(arun): Should never be empty once propogation score recovery is in place
-        let propogation_scores_ready = !scores.scores_per_authority.is_empty();
+        self.ancestor_state_manager.update_all_ancestors_state();
 
-        let (top_scores, bottom_scores) =
-            scores.split_top_and_bottom_scores(self.context.clone(), bottom_percentage);
+        let ancestor_state_map = self.ancestor_state_manager.get_all_states();
 
-        debug!(
-            "Found {} top scores {top_scores:?} & {} bottom scores {bottom_scores:?}",
-            top_scores.len(),
-            bottom_scores.len(),
-        );
-
-        let mut low_score_ancestors = Vec::new();
+        let mut temp_excluded_ancestors = Vec::new();
 
         // Propose only ancestors of higher rounds than what has already been proposed.
         // And always include own last proposed block first among ancestors.
         // Start by only including the high scoring ancestors. Low scoring ancestors
         // will be included in a second pass below.
-        let high_score_ancestors = iter::once(self.last_proposed_block.clone())
+        let included_ancestors = iter::once(self.last_proposed_block.clone())
             .chain(
                 ancestors
                     .into_iter()
                     .filter(|ancestor| ancestor.author() != self.context.own_index)
                     .flat_map(|ancestor| {
-                        if propogation_scores_ready {
-                            if let Some(score) = top_scores.get(&ancestor.author()) {
-                                debug!("Found ancestor {ancestor} with good score {score} for round {clock_round}");
-                            } else {
-                                let score = bottom_scores
-                                    .get(&ancestor.author())
-                                    .expect("Authority score will always be available as bottom score if not in top score");
-                                debug!("Added ancestor {ancestor} with score {score} to low score ancestors for round {clock_round}");
-                                low_score_ancestors.push((*score, ancestor));
+
+                        let ancestor_state = ancestor_state_map.get(&ancestor.author()).expect(
+                            &format!("Should have ancestor state for {}", ancestor.author()),
+                        );
+
+                        match ancestor_state {
+                            AncestorState::Include => {
+                                debug!("Found ancestor {ancestor} with INCLUDE state for round {clock_round}");
+                            }
+                            AncestorState::Exclude(score) => {
+                                debug!("Added ancestor {ancestor} with EXCLUDE state with score {score} to temporary excluded ancestors for round {clock_round}");
+                                temp_excluded_ancestors.push((*score, ancestor));
                                 return None;
                             }
                         }
 
-                        if let Some(last_block_ref) = self.last_included_ancestors[ancestor.author()] {
+                        if let Some(last_block_ref) =
+                            self.last_included_ancestors[ancestor.author()]
+                        {
                             return (last_block_ref.round < ancestor.round()).then_some(ancestor);
                         }
                         Some(ancestor)
@@ -870,7 +899,7 @@ impl Core {
         let mut parent_round_quorum = StakeAggregator::<QuorumThreshold>::new();
 
         // Check total stake of high scoring parent round ancestors
-        for ancestor in high_score_ancestors
+        for ancestor in included_ancestors
             .iter()
             .filter(|a| a.round() == clock_round - 1)
         {
@@ -878,13 +907,13 @@ impl Core {
         }
 
         if smart_select && !parent_round_quorum.reached_threshold(&self.context.committee) {
-            debug!("Not enough good ancestors yet to propose for round {clock_round}");
+            debug!("Found {} stake of good ancestors to include for round {clock_round}, will wait for more.", parent_round_quorum.stake());
             return vec![];
         }
 
         // Now we can update the last included ancestor block refs as there is no way
         // to short circuit ancestor proposal.
-        for ancestor in high_score_ancestors.iter() {
+        for ancestor in included_ancestors.iter() {
             debug!(
                 "Included ancestor {ancestor} to propose for round {clock_round}, own_block = {}",
                 ancestor.author() == self.context.own_index
@@ -892,18 +921,18 @@ impl Core {
             self.last_included_ancestors[ancestor.author()] = Some(ancestor.reference());
         }
 
-        // Sort scores descending so we can include the best low scoring ancestors first
-        // until we reach the threshold.
-        low_score_ancestors.sort_by(|a, b| b.0.cmp(&a.0));
+        // Sort scores descending so we can include the best of the temp excluded
+        // ancestors first until we reach the threshold.
+        temp_excluded_ancestors.sort_by(|a, b| b.0.cmp(&a.0));
 
-        let mut ancestors_to_propose = high_score_ancestors;
+        let mut ancestors_to_propose = included_ancestors;
         let mut excluded_ancestors = Vec::new();
 
-        for (score, ancestor) in low_score_ancestors.into_iter() {
+        for (score, ancestor) in temp_excluded_ancestors.into_iter() {
             if !parent_round_quorum.reached_threshold(&self.context.committee)
                 && ancestor.round() == clock_round - 1
             {
-                debug!("Including low score strong link ancestor {ancestor} with score {score} to propose for round {clock_round}");
+                debug!("Including temporarily excluded strong link ancestor {ancestor} with score {score} to propose for round {clock_round}");
                 parent_round_quorum.add(ancestor.author(), &self.context.committee);
                 self.last_included_ancestors[ancestor.author()] = Some(ancestor.reference());
                 ancestors_to_propose.push(ancestor);
@@ -912,24 +941,26 @@ impl Core {
             }
         }
 
-        // Inclusion of weak links for low score ancestors
+        // Inclusion of weak links for low score ancestors so there is no long
+        // list of blocks that we need to include later.
         for (score, ancestor) in excluded_ancestors.iter() {
             let excluded_author = ancestor.author();
             let block_hostname = &self.context.committee.authority(excluded_author).hostname;
-            let mut network_quorum_round = self.propagation_delay_per_authority[excluded_author];
+            let mut network_low_quorum_round =
+                self.ancestor_state_manager.quorum_round_per_authority[excluded_author].0;
 
             // If the network quourum round for this ancestor is greater than or equal
             // to the clock round then we want to make sure to set it to clock_round - 1
             // as that is the max round we can include as an ancestor.
-            network_quorum_round = network_quorum_round.min(clock_round - 1);
+            network_low_quorum_round = network_low_quorum_round.min(clock_round - 1);
 
             if let Some(last_block_ref) = self.last_included_ancestors[excluded_author] {
-                if last_block_ref.round < network_quorum_round {
-                    if ancestor.round() == network_quorum_round {
+                if last_block_ref.round < network_low_quorum_round {
+                    if ancestor.round() == network_low_quorum_round {
                         // Include the ancestor block as it has been seen by a strong quorum
                         self.last_included_ancestors[excluded_author] = Some(ancestor.reference());
                         ancestors_to_propose.push(ancestor.clone());
-                        debug!("Included low scoring ancestor {ancestor} with score {score} seen at network quorum round {network_quorum_round} to propose for round {clock_round}");
+                        debug!("Included low scoring ancestor {ancestor} with score {score} seen at network quorum round {network_low_quorum_round} to propose for round {clock_round}");
                         self.context
                             .metrics
                             .node_metrics
@@ -944,14 +975,14 @@ impl Core {
                         .dag_state
                         .read()
                         .get_uncommitted_blocks_at_slot(Slot::new(
-                            network_quorum_round,
+                            network_low_quorum_round,
                             excluded_author,
                         ));
 
                     if let Some(block) = blocks.first() {
                         self.last_included_ancestors[excluded_author] = Some(block.reference());
                         ancestors_to_propose.push(block.clone());
-                        debug!("Included low scoring ancestor {ancestor} with score {score} seen at network quorum round {network_quorum_round} to propose for round {clock_round}");
+                        debug!("Included low scoring ancestor {block} with score {score} seen at network quorum round {network_low_quorum_round} to propose for round {clock_round}");
                         self.context
                             .metrics
                             .node_metrics
@@ -960,7 +991,7 @@ impl Core {
                             .inc();
                         continue;
                     } else {
-                        debug!("No earlier uncommitted block found for low scoring ancestor {ancestor} with score {score} seen at network quorum round {network_quorum_round} to propose for round {clock_round}");
+                        debug!("No earlier uncommitted block found for low scoring ancestor {ancestor} with score {score} seen at network quorum round {network_low_quorum_round} to propose for round {clock_round}");
                     }
                 }
             }
@@ -2064,7 +2095,7 @@ mod test {
         );
 
         // Use a large propagation for own authority delay to disable proposing.
-        core.set_propagation_delay_per_authority(vec![1000, 0, 0, 0]);
+        core.propagation_delay = 1000;
 
         // Make propagation delay the only reason for not proposing.
         core.set_subscriber_exists(true);
@@ -2073,7 +2104,7 @@ mod test {
         assert!(core.try_propose(true).unwrap().is_none());
 
         // Let Core know there is no propagation delay for own authority.
-        core.set_propagation_delay_per_authority(vec![0, 0, 0, 0]);
+        core.propagation_delay = 0;
 
         // Proposing now would succeed.
         assert!(core.try_propose(true).unwrap().is_some());

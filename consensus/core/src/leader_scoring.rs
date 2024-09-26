@@ -152,7 +152,7 @@ impl ReputationScores {
         (top_scores, bottom_scores)
     }
 
-    pub fn high_score(&self) -> u64 {
+    pub(crate) fn high_score(&self) -> u64 {
         *self.scores_per_authority.iter().max().unwrap_or(&0)
     }
 

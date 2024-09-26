@@ -133,6 +133,7 @@ mod tests {
     use crate::core::CoreSignals;
     use crate::core_thread::{CoreError, CoreThreadDispatcher};
     use crate::leader_timeout::LeaderTimeoutTask;
+    use crate::round_prober::QuorumRound;
 
     #[derive(Clone, Default)]
     struct MockCoreThreadDispatcher {
@@ -171,9 +172,9 @@ mod tests {
             todo!()
         }
 
-        fn set_propagation_delay_per_authority(
+        fn set_propagation_delay_and_quorum_rounds(
             &self,
-            _delay_per_authority: Vec<Round>,
+            _quorum_rounds: Vec<QuorumRound>,
         ) -> Result<(), CoreError> {
             todo!()
         }
