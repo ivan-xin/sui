@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use consensus_config::{Committee, NetworkKeyPair, Parameters, ProtocolKeyPair};
 use consensus_core::{CommitConsumer, CommitIndex, ConsensusAuthority};
 use fastcrypto::ed25519;
-use mysten_metrics::{monitored_mpsc::unbounded_channel, RegistryID, RegistryService};
+use mysten_metrics::{RegistryID, RegistryService};
 use prometheus::Registry;
 use sui_config::NodeConfig;
 use sui_protocol_config::ConsensusNetwork;
@@ -144,14 +144,10 @@ impl ConsensusManagerTrait for MysticetiManager {
 
         let registry = Registry::new_custom(Some("consensus".to_string()), None).unwrap();
 
-        let (commit_sender, commit_receiver) = unbounded_channel("consensus_output");
-
         let consensus_handler = consensus_handler_initializer.new_consensus_handler();
-        let consumer = CommitConsumer::new(
-            commit_sender,
-            consensus_handler.last_processed_subdag_index() as CommitIndex,
-        );
-        let monitor = consumer.monitor();
+        let (commit_consumer, commit_receiver, _) =
+            CommitConsumer::new(consensus_handler.last_processed_subdag_index() as CommitIndex);
+        let monitor = commit_consumer.monitor();
 
         // TODO(mysticeti): Investigate if we need to return potential errors from
         // AuthorityNode and add retries here?
@@ -165,7 +161,7 @@ impl ConsensusManagerTrait for MysticetiManager {
             self.protocol_keypair.clone(),
             self.network_keypair.clone(),
             Arc::new(tx_validator.clone()),
-            consumer,
+            commit_consumer,
             registry.clone(),
             boot_counter,
         )
