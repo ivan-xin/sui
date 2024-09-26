@@ -145,12 +145,10 @@ impl ConsensusManagerTrait for MysticetiManager {
         let registry = Registry::new_custom(Some("consensus".to_string()), None).unwrap();
 
         let consensus_handler = consensus_handler_initializer.new_consensus_handler();
-        let (commit_consumer, commit_receiver, _) =
+        let (commit_consumer, commit_receiver, transaction_receiver) =
             CommitConsumer::new(consensus_handler.last_processed_subdag_index() as CommitIndex);
         let monitor = commit_consumer.monitor();
 
-        // TODO(mysticeti): Investigate if we need to return potential errors from
-        // AuthorityNode and add retries here?
         let boot_counter = *self.boot_counter.lock().await;
         let authority = ConsensusAuthority::start(
             network_type,
@@ -181,7 +179,12 @@ impl ConsensusManagerTrait for MysticetiManager {
         self.client.set(client);
 
         // spin up the new mysticeti consensus handler to listen for committed sub dags
-        let handler = MysticetiConsensusHandler::new(consensus_handler, commit_receiver, monitor);
+        let handler = MysticetiConsensusHandler::new(
+            consensus_handler,
+            commit_receiver,
+            transaction_receiver,
+            monitor,
+        );
         let mut consensus_handler = self.consensus_handler.lock().await;
         *consensus_handler = Some(handler);
 

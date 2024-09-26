@@ -10,9 +10,11 @@ use std::{
 
 use arc_swap::ArcSwap;
 use consensus_config::Committee as ConsensusCommittee;
-use consensus_core::CommitConsumerMonitor;
+use consensus_core::{CommitConsumerMonitor, TransactionIndex, VerifiedBlock};
 use lru::LruCache;
-use mysten_metrics::{monitored_mpsc::UnboundedReceiver, monitored_scope, spawn_monitored_task};
+use mysten_metrics::{
+    monitored_future, monitored_mpsc::UnboundedReceiver, monitored_scope, spawn_monitored_task,
+};
 use serde::{Deserialize, Serialize};
 use sui_macros::{fail_point_async, fail_point_if};
 use sui_protocol_config::ProtocolConfig;
@@ -25,6 +27,7 @@ use sui_types::{
     sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait,
     transaction::{SenderSignedData, VerifiedTransaction},
 };
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, instrument, trace_span, warn};
 
 use crate::{
@@ -180,7 +183,7 @@ fn update_index_and_hash(
     index: ExecutionIndices,
     v: &[u8],
 ) {
-    // The entry point of handle_consensus_output_internal() has filtered out any already processed
+    // The entry point of handle_consensus_commit() has filtered out any already processed
     // consensus output. So we can safely assume that the index is always increasing.
     assert!(last_consensus_stats.index < index);
 
@@ -203,14 +206,8 @@ fn update_index_and_hash(
 
 impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
     #[instrument(level = "debug", skip_all)]
-    async fn handle_consensus_output(&mut self, consensus_output: impl ConsensusOutputAPI) {
+    async fn handle_consensus_commit(&mut self, consensus_output: impl ConsensusOutputAPI) {
         let _scope = monitored_scope("HandleConsensusOutput");
-
-        // This code no longer supports old protocol versions.
-        assert!(self
-            .epoch_store
-            .protocol_config()
-            .consensus_order_end_of_epoch_last());
 
         let last_committed_round = self.last_consensus_stats.index.last_committed_round;
 
@@ -483,43 +480,37 @@ impl AsyncTransactionScheduler {
 /// During initialization, the sender is passed into Mysticeti which can send consensus output
 /// to the channel.
 pub struct MysticetiConsensusHandler {
-    handle: Option<tokio::task::JoinHandle<()>>,
+    tasks: JoinSet<()>,
 }
 
 impl MysticetiConsensusHandler {
     pub fn new(
         mut consensus_handler: ConsensusHandler<CheckpointService>,
-        mut receiver: UnboundedReceiver<consensus_core::CommittedSubDag>,
+        mut commit_receiver: UnboundedReceiver<consensus_core::CommittedSubDag>,
+        mut transaction_receiver: UnboundedReceiver<(VerifiedBlock, Vec<TransactionIndex>)>,
         commit_consumer_monitor: Arc<CommitConsumerMonitor>,
     ) -> Self {
-        let handle = spawn_monitored_task!(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(monitored_future!(async move {
             // TODO: pause when execution is overloaded, so consensus can detect the backpressure.
-            while let Some(consensus_output) = receiver.recv().await {
+            while let Some(consensus_output) = commit_receiver.recv().await {
                 let commit_index = consensus_output.commit_ref.index;
                 consensus_handler
-                    .handle_consensus_output(consensus_output)
+                    .handle_consensus_commit(consensus_output)
                     .await;
                 commit_consumer_monitor.set_highest_handled_commit(commit_index);
             }
-        });
-        Self {
-            handle: Some(handle),
-        }
+        }));
+        tasks.spawn(monitored_future!(async move {
+            while let Some((block, transaction_indices)) = transaction_receiver.recv().await {
+                continue;
+            }
+        }));
+        Self { tasks }
     }
 
     pub async fn abort(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
-    }
-}
-
-impl Drop for MysticetiConsensusHandler {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-        }
+        self.tasks.shutdown().await;
     }
 }
 
@@ -962,7 +953,7 @@ mod tests {
 
         // AND processing the consensus output once
         consensus_handler
-            .handle_consensus_output(committed_sub_dag.clone())
+            .handle_consensus_commit(committed_sub_dag.clone())
             .await;
 
         // AND capturing the consensus stats
@@ -989,7 +980,7 @@ mod tests {
         // THEN the consensus stats do not update
         for _ in 0..2 {
             consensus_handler
-                .handle_consensus_output(committed_sub_dag.clone())
+                .handle_consensus_commit(committed_sub_dag.clone())
                 .await;
             let last_consensus_stats_2 = consensus_handler.last_consensus_stats.clone();
             assert_eq!(last_consensus_stats_1, last_consensus_stats_2);
